@@ -23,6 +23,11 @@ import (
 	"context"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
+	sourcesv1 "knative.dev/eventing/pkg/apis/sources/v1"
+
 	"github.com/apache/incubator-kie-kogito-serverless-operator/api/v1alpha08"
 	"github.com/apache/incubator-kie-kogito-serverless-operator/controllers/clusterplatform"
 	"github.com/apache/incubator-kie-kogito-serverless-operator/controllers/platform/services"
@@ -826,5 +831,75 @@ func TestSonataFlowPlatformController(t *testing.T) {
 		assert.Empty(t, kscp.Spec.Capabilities.Workflows)
 		assert.NotNil(t, ksp2.Status.ClusterPlatformRef)
 		assert.Nil(t, ksp2.Status.ClusterPlatformRef.Services)
+	})
+	t.Run("verify that knative resources creation for job service and data index service is performed without error", func(t *testing.T) {
+		namespace := t.Name()
+		// Create a SonataFlowPlatform object with metadata and spec.
+		ksp := test.GetBasePlatformInReadyPhase(namespace)
+		brokerName := "default"
+		enabled := true
+		ksp.Spec.Services = &v1alpha08.ServicesPlatformSpec{
+			Broker: &brokerName,
+			DataIndex: &v1alpha08.ServiceSpec{
+				Enabled: &enabled,
+			},
+			JobService: &v1alpha08.ServiceSpec{
+				Enabled: &enabled,
+			},
+		}
+
+		broker := &eventingv1.Broker{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      brokerName,
+				Namespace: namespace,
+			},
+		}
+
+		// Create a fake client to mock API calls.
+		cl := test.NewKogitoClientBuilderWithOpenShift().WithRuntimeObjects(ksp, broker).WithStatusSubresource(ksp, broker).Build()
+		// Create a SonataFlowPlatformReconciler object with the scheme and fake client.
+		r := &SonataFlowPlatformReconciler{cl, cl, cl.Scheme(), &rest.Config{}, &record.FakeRecorder{}}
+
+		// Mock request to simulate Reconcile() being called on an event for a
+		// watched resource .
+		req := reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      ksp.Name,
+				Namespace: ksp.Namespace,
+			},
+		}
+		_, err := r.Reconcile(context.TODO(), req)
+		if err != nil {
+			t.Fatalf("reconcile: (%v)", err)
+		}
+
+		assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: ksp.Name, Namespace: ksp.Namespace}, ksp))
+
+		// Perform some checks on the created CR
+		assert.Equal(t, "quay.io/kiegroup", ksp.Spec.Build.Config.Registry.Address)
+		assert.Equal(t, "regcred", ksp.Spec.Build.Config.Registry.Secret)
+		assert.Equal(t, v1alpha08.OperatorBuildStrategy, ksp.Spec.Build.Config.BuildStrategy)
+		assert.NotNil(t, ksp.Spec.Services.DataIndex)
+		assert.NotNil(t, ksp.Spec.Services.DataIndex.Enabled)
+		assert.Equal(t, true, *ksp.Spec.Services.DataIndex.Enabled)
+		assert.NotNil(t, ksp.Spec.Services.JobService)
+		assert.NotNil(t, ksp.Spec.Services.JobService.Enabled)
+		assert.Equal(t, true, *ksp.Spec.Services.JobService.Enabled)
+		assert.Equal(t, v1alpha08.PlatformClusterKubernetes, ksp.Status.Cluster)
+
+		assert.Equal(t, "", ksp.Status.GetTopLevelCondition().Reason)
+
+		// Check Triggers
+		trigger := &eventingv1.Trigger{}
+		assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: "jobs-service-create-job-trigger", Namespace: ksp.Namespace}, trigger))
+		assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: "jobs-service-delete-job-trigger", Namespace: ksp.Namespace}, trigger))
+		assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: "data-index-service-jobs-trigger", Namespace: ksp.Namespace}, trigger))
+		assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: "data-index-service-processes-definition-trigger", Namespace: ksp.Namespace}, trigger))
+		assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: "data-index-service-processes-instance-trigger", Namespace: ksp.Namespace}, trigger))
+
+		// Check SinkBinding
+		sinkBinding := &sourcesv1.SinkBinding{}
+		assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: "jobs-service-sb", Namespace: ksp.Namespace}, sinkBinding))
+
 	})
 }

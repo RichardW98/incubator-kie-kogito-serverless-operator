@@ -16,6 +16,9 @@ package v1alpha08
 
 // ServicesPlatformSpec describes the desired service configuration for workflows without the `sonataflow.org/profile: dev` annotation.
 type ServicesPlatformSpec struct {
+	// Broker to commute with workflow deployment
+	// +optional
+	Broker *string `json:"broker,omitempty"`
 	// Deploys the Data Index service for use by workflows without the `sonataflow.org/profile: dev` annotation.
 	// +optional
 	DataIndex *ServiceSpec `json:"dataIndex,omitempty"`

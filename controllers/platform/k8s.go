@@ -85,7 +85,10 @@ func createOrUpdateServiceComponents(ctx context.Context, client client.Client, 
 	if err := createOrUpdateDeployment(ctx, client, platform, psh); err != nil {
 		return err
 	}
-	return createOrUpdateService(ctx, client, platform, psh)
+	if err := createOrUpdateService(ctx, client, platform, psh); err != nil {
+		return err
+	}
+	return createKnativeResources(ctx, client, platform, psh)
 }
 
 func createOrUpdateDeployment(ctx context.Context, client client.Client, platform *operatorapi.SonataFlowPlatform, psh services.PlatformServiceHandler) error {
@@ -273,5 +276,34 @@ func createOrUpdateConfigMap(ctx context.Context, client client.Client, platform
 		klog.V(log.I).InfoS("ConfigMap successfully reconciled", "operation", op)
 	}
 
+	return nil
+}
+
+func createKnativeResources(ctx context.Context, client client.Client, platform *operatorapi.SonataFlowPlatform, psh services.PlatformServiceHandler) error {
+	// check broker availability
+	brokerName := platform.Spec.Services.Broker
+
+	if !services.IsKnativeAvailableForPlatformService(ctx, client, brokerName, platform.Namespace) {
+		return nil
+	}
+
+	lbl, _ := getLabels(platform, psh)
+	if objs, err := psh.GenerateKnativeResources(brokerName, platform.Namespace, lbl); err != nil {
+		return err
+	} else if len(objs) > 0 {
+		for _, obj := range objs {
+			if op, err := controllerutil.CreateOrUpdate(ctx, client, obj, func() error {
+				if err := controllerutil.SetControllerReference(platform, obj, client.Scheme()); err != nil {
+					return err
+				}
+				return nil
+			}); err != nil {
+				return err
+			} else {
+				klog.V(log.I).InfoS("Knative Eventing resources successfully created", "operation", op)
+			}
+		}
+		return nil
+	}
 	return nil
 }

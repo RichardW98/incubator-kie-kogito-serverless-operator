@@ -22,13 +22,19 @@ package services
 import (
 	"fmt"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
-
 	operatorapi "github.com/apache/incubator-kie-kogito-serverless-operator/api/v1alpha08"
 	"github.com/apache/incubator-kie-kogito-serverless-operator/controllers/profiles/common/constants"
 	"github.com/apache/incubator-kie-kogito-serverless-operator/controllers/profiles/common/persistence"
 	"github.com/magiconair/properties"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
+	sourcesv1 "knative.dev/eventing/pkg/apis/sources/v1"
+	"knative.dev/pkg/apis"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
+	"knative.dev/pkg/tracker"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/apache/incubator-kie-kogito-serverless-operator/version"
 	"github.com/imdario/mergo"
@@ -72,6 +78,8 @@ type PlatformServiceHandler interface {
 	GenerateWorkflowProperties() (*properties.Properties, error)
 	// GenerateServiceProperties returns a property object that contains the application properties required by the service deployment
 	GenerateServiceProperties() (*properties.Properties, error)
+	// GenerateKnativeResources returns knative resources that bridge between workflow deploys and the service
+	GenerateKnativeResources(brokerName *string, namespace string, lbl map[string]string) ([]client.Object, error)
 
 	// IsServiceSetInSpec returns true if the service is set in the spec.
 	IsServiceSetInSpec() bool
@@ -238,9 +246,24 @@ func (d DataIndexHandler) GetServiceCmName() string {
 func (d DataIndexHandler) GenerateWorkflowProperties() (*properties.Properties, error) {
 	props := properties.NewProperties()
 	if d.IsServiceEnabled() {
-		props.Set(constants.KogitoDataIndexURL, d.GetServiceBaseUrl())
-		props.Set(constants.KogitoProcessDefinitionsEventsURL, d.GetServiceBaseUrl()+constants.KogitoProcessDefinitionsEventsPath)
-		props.Set(constants.KogitoProcessInstancesEventsURL, d.GetServiceBaseUrl()+constants.KogitoProcessInstancesEventsPath)
+		if d.platform.Spec.Services.Broker == nil {
+			props.Set(constants.KogitoDataIndexURL, d.GetServiceBaseUrl())
+			props.Set(constants.KogitoProcessDefinitionsEventsURL, d.GetServiceBaseUrl()+constants.KogitoProcessDefinitionsEventsPath)
+			props.Set(constants.KogitoProcessInstancesEventsURL, d.GetServiceBaseUrl()+constants.KogitoProcessInstancesEventsPath)
+		} else {
+			// process-definitions
+			props.Set(constants.KogitoProcessDefinitionsEventsURL, constants.KnativeInjectedEnvVar)
+			props.Set(constants.KogitoProcessDefinitionsEventsConnector, constants.QuarkusHTTP)
+			props.Set(constants.KogitoProcessDefinitionsEventsMethod, constants.Post)
+			// process-instances
+			props.Set(constants.KogitoProcessInstancesEventsURL, constants.KnativeInjectedEnvVar)
+			props.Set(constants.KogitoProcessInstancesEventsConnector, constants.QuarkusHTTP)
+			props.Set(constants.KogitoProcessInstancesEventsMethod, constants.Post)
+			// job status
+			props.Set(constants.JobServiceEventsURL, constants.KnativeInjectedEnvVar)
+			props.Set(constants.JobServiceEventsConnector, constants.QuarkusHTTP)
+			props.Set(constants.JobServiceEventsMethod, constants.Post)
+		}
 	}
 	return props, nil
 }
@@ -408,9 +431,16 @@ func (j JobServiceHandler) GenerateServiceProperties() (*properties.Properties, 
 	}
 
 	if isDataIndexEnabled(j.platform) {
-		di := NewDataIndexHandler(j.platform)
 		props.Set(constants.JobServiceStatusChangeEvents, "true")
-		props.Set(constants.JobServiceStatusChangeEventsURL, di.GetLocalServiceBaseUrl()+"/jobs")
+		if j.platform.Spec.Services.Broker == nil {
+			di := NewDataIndexHandler(j.platform)
+			props.Set(constants.JobServiceStatusChangeEventsURL, di.GetLocalServiceBaseUrl()+"/jobs")
+		} else {
+			// job status
+			props.Set(constants.JobServiceStatusChangeEventsURL, constants.KnativeInjectedEnvVar)
+			props.Set(constants.JobServiceStatusChangeEventsConnector, constants.QuarkusHTTP)
+			props.Set(constants.JobServiceStatusChangeEventsMethod, constants.Post)
+		}
 	}
 	props.Sort()
 	return props, nil
@@ -419,8 +449,15 @@ func (j JobServiceHandler) GenerateServiceProperties() (*properties.Properties, 
 func (j JobServiceHandler) GenerateWorkflowProperties() (*properties.Properties, error) {
 	props := properties.NewProperties()
 	if j.IsServiceEnabled() {
-		props.Set(constants.KogitoJobServiceURL, j.GetServiceBaseUrl())
-		props.Set(constants.JobServiceRequestEventsURL, j.GetServiceBaseUrl()+constants.JobServiceJobEventsPath)
+		if j.platform.Spec.Services.Broker == nil {
+			props.Set(constants.KogitoJobServiceURL, j.GetServiceBaseUrl())
+			props.Set(constants.JobServiceRequestEventsURL, j.GetServiceBaseUrl()+constants.JobServiceJobEventsPath)
+		} else {
+			// job creation
+			props.Set(constants.JobServiceRequestEventsURL, constants.KnativeInjectedEnvVar)
+			props.Set(constants.JobServiceRequestEventsConnector, constants.QuarkusHTTP)
+			props.Set(constants.JobServiceRequestEventsMethod, constants.Post)
+		}
 	}
 	return props, nil
 }
@@ -455,4 +492,171 @@ func GenerateServiceURL(protocol string, namespace string, name string) string {
 		serviceUrl = fmt.Sprintf("%s://%s", protocol, name)
 	}
 	return serviceUrl
+}
+
+func (d DataIndexHandler) GenerateKnativeResources(brokerName *string, namespace string, lbl map[string]string) ([]client.Object, error) {
+	processInstancesTrigger := &eventingv1.Trigger{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-index-service-processes-instance-trigger",
+			Namespace: namespace,
+			Labels:    lbl,
+		},
+		Spec: eventingv1.TriggerSpec{
+			Broker: constants.KnativeEventingBrokerDefault,
+			Filter: &eventingv1.TriggerFilter{
+				Attributes: eventingv1.TriggerFilterAttributes{
+					"type": "ProcessInstanceEvent",
+				},
+			},
+			Subscriber: duckv1.Destination{
+				Ref: &duckv1.KReference{
+					Name:       d.GetServiceName(),
+					Namespace:  namespace,
+					APIVersion: "v1",
+					Kind:       "Service",
+				},
+				URI: &apis.URL{
+					Path: "/processes",
+				},
+			},
+		},
+	}
+	processDefinitionsTrigger := &eventingv1.Trigger{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-index-service-processes-definition-trigger",
+			Namespace: namespace,
+			Labels:    lbl,
+		},
+		Spec: eventingv1.TriggerSpec{
+			Broker: constants.KnativeEventingBrokerDefault,
+			Filter: &eventingv1.TriggerFilter{
+				Attributes: eventingv1.TriggerFilterAttributes{
+					"type": "ProcessDefinitionEvent",
+				},
+			},
+			Subscriber: duckv1.Destination{
+				Ref: &duckv1.KReference{
+					Name:       d.GetServiceName(),
+					Namespace:  namespace,
+					APIVersion: "v1",
+					Kind:       "Service",
+				},
+				URI: &apis.URL{
+					Path: "/definitions",
+				},
+			},
+		},
+	}
+	jobTrigger := &eventingv1.Trigger{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-index-service-jobs-trigger",
+			Namespace: namespace,
+			Labels:    lbl,
+		},
+		Spec: eventingv1.TriggerSpec{
+			Broker: constants.KnativeEventingBrokerDefault,
+			Filter: &eventingv1.TriggerFilter{
+				Attributes: eventingv1.TriggerFilterAttributes{
+					"type": "JobEvent",
+				},
+			},
+			Subscriber: duckv1.Destination{
+				Ref: &duckv1.KReference{
+					Name:       d.GetServiceName(),
+					Namespace:  namespace,
+					APIVersion: "v1",
+					Kind:       "Service",
+				},
+				URI: &apis.URL{
+					Path: "/jobs",
+				},
+			},
+		},
+	}
+	return []client.Object{processInstancesTrigger, processDefinitionsTrigger, jobTrigger}, nil
+}
+
+func (j JobServiceHandler) GenerateKnativeResources(brokerName *string, namespace string, lbl map[string]string) ([]client.Object, error) {
+	jobCreateTrigger := &eventingv1.Trigger{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "jobs-service-create-job-trigger",
+			Namespace: namespace,
+			Labels:    lbl,
+		},
+		Spec: eventingv1.TriggerSpec{
+			Broker: constants.KnativeEventingBrokerDefault,
+			Filter: &eventingv1.TriggerFilter{
+				Attributes: eventingv1.TriggerFilterAttributes{
+					"type": "job.create",
+				},
+			},
+			Subscriber: duckv1.Destination{
+				Ref: &duckv1.KReference{
+					Name:       j.GetServiceName(),
+					Namespace:  namespace,
+					APIVersion: "v1",
+					Kind:       "Service",
+				},
+				URI: &apis.URL{
+					Path: "/v2/jobs/events",
+				},
+			},
+		},
+	}
+
+	jobDeleteTrigger := &eventingv1.Trigger{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "jobs-service-delete-job-trigger",
+			Namespace: namespace,
+			Labels:    lbl,
+		},
+		Spec: eventingv1.TriggerSpec{
+			Broker: constants.KnativeEventingBrokerDefault,
+			Filter: &eventingv1.TriggerFilter{
+				Attributes: eventingv1.TriggerFilterAttributes{
+					"type": "job.delete",
+				},
+			},
+			Subscriber: duckv1.Destination{
+				Ref: &duckv1.KReference{
+					Name:       j.GetServiceName(),
+					Namespace:  namespace,
+					APIVersion: "v1",
+					Kind:       "Service",
+				},
+				URI: &apis.URL{
+					Path: "/v2/jobs/events",
+				},
+			},
+		},
+	}
+
+	sinkBinding := &sourcesv1.SinkBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "jobs-service-sb",
+			Namespace: namespace,
+			Labels:    lbl,
+		},
+		Spec: sourcesv1.SinkBindingSpec{
+			SourceSpec: duckv1.SourceSpec{
+				Sink: duckv1.Destination{
+					Ref: &duckv1.KReference{
+						Name:       *brokerName,
+						Namespace:  namespace,
+						APIVersion: "eventing.knative.dev/v1",
+						Kind:       "Broker",
+					},
+				},
+			},
+			BindingSpec: duckv1.BindingSpec{
+				Subject: tracker.Reference{
+					Name:       j.GetServiceName(),
+					Namespace:  namespace,
+					APIVersion: "apps/v1",
+					Kind:       "Deployment",
+				},
+			},
+		},
+	}
+	return []client.Object{jobCreateTrigger, jobDeleteTrigger, sinkBinding}, nil
 }
